@@ -20,11 +20,6 @@ const PROXIES = [
 const PROXY_USER = "dxicdysy";
 const PROXY_PASS = "yndikr9coeto";
 
-function getRandomProxy() {
-  const proxy = PROXIES[Math.floor(Math.random() * PROXIES.length)];
-  return `http://${PROXY_USER}:${PROXY_PASS}@${proxy}`;
-}
-
 // ── Headers ───────────────────────────────────────────────────────────────────
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
@@ -40,9 +35,7 @@ const BASE_HEADERS = {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function decodeApiResponse(raw) {
   raw = raw.trim();
-  try {
-    return JSON.parse(raw);
-  } catch (_) {}
+  try { return JSON.parse(raw); } catch (_) {}
   try {
     const padded = raw + "=".repeat((4 - (raw.length % 4)) % 4);
     return JSON.parse(Buffer.from(padded, "base64").toString("utf8"));
@@ -53,55 +46,69 @@ function decodeApiResponse(raw) {
 function parseMasterPlaylist(html) {
   const idx = html.indexOf("window.masterPlaylist");
   if (idx === -1) return null;
-
   const start = html.indexOf("{", idx);
   if (start === -1) return null;
 
   let depth = 0, end = start;
   for (let i = start; i < html.length; i++) {
     if (html[i] === "{") depth++;
-    else if (html[i] === "}") {
-      depth--;
-      if (depth === 0) { end = i; break; }
-    }
+    else if (html[i] === "}") { depth--; if (depth === 0) { end = i; break; } }
   }
 
   const block = html.substring(start, end + 1);
-  const urlMatch    = block.match(/url\s*:\s*['"]([^'"]+)['"]/);
-  const tokenMatch  = block.match(/['"]token['"]\s*:\s*['"]([^'"]+)['"]/);
-  const expiresMatch = block.match(/['"]expires['"]\s*:\s*['"]([^'"]*)['"]/);
+  const baseUrl = block.match(/url\s*:\s*['"]([^'"]+)['"]/)?.[1] ?? null;
+  const token   = block.match(/['"]token['"]\s*:\s*['"]([^'"]+)['"]/)?.[1] ?? null;
+  const expires = block.match(/['"]expires['"]\s*:\s*['"]([^'"]*)['"]/)?.[1] ?? null;
 
-  const baseUrl = urlMatch?.[1] ?? null;
-  const token   = tokenMatch?.[1] ?? null;
-  const expires = expiresMatch?.[1] ?? null;
-
-  if (baseUrl && token) {
-    return `${baseUrl}?token=${token}&expires=${expires}&h=1&lang=en`;
-  }
-  return null;
+  return (baseUrl && token)
+    ? `${baseUrl}?token=${token}&expires=${expires}&h=1&lang=en`
+    : null;
 }
 
-// ── Proxied fetch wrapper ─────────────────────────────────────────────────────
-async function proxiedFetch(url, options = {}) {
-  const proxyUrl = getRandomProxy();
-  const agent = new HttpsProxyAgent(proxyUrl);
-  const res = await fetch(url, { ...options, agent });
-  return res;
+// ── Fetch with fallback across ALL proxies ────────────────────────────────────
+async function fetchWithProxyFallback(url, options = {}, label = "") {
+  // Shuffle proxy list so we don't always hammer the same one first
+  const shuffled = [...PROXIES].sort(() => Math.random() - 0.5);
+
+  for (let i = 0; i < shuffled.length; i++) {
+    const proxyUrl = `http://${PROXY_USER}:${PROXY_PASS}@${shuffled[i]}`;
+    const agent = new HttpsProxyAgent(proxyUrl);
+    try {
+      console.log(`[${label}] Trying proxy ${i + 1}/${shuffled.length}: ${shuffled[i]}`);
+      const res = await fetch(url, { ...options, agent });
+
+      if (res.status === 403 || res.status === 429) {
+        console.warn(`[${label}] Proxy ${shuffled[i]} got ${res.status}, trying next...`);
+        continue; // try next proxy
+      }
+
+      console.log(`[${label}] Success with proxy ${shuffled[i]} → status ${res.status}`);
+      return res; // ✅ good response
+    } catch (err) {
+      console.warn(`[${label}] Proxy ${shuffled[i]} threw: ${err.message}, trying next...`);
+    }
+  }
+
+  throw new Error(`All ${shuffled.length} proxies failed for: ${url}`);
 }
 
 // ── Core logic ────────────────────────────────────────────────────────────────
 async function getStream(movieId) {
-  // 1. Session warmup
-  const r1 = await proxiedFetch(`https://vixsrc.to/movie/${movieId}`, {
-    headers: {
-      ...BASE_HEADERS,
-      Accept: "text/html,application/xhtml+xml,*/*;q=0.8",
-      "sec-fetch-dest": "document",
-      "sec-fetch-mode": "navigate",
-      "sec-fetch-site": "none",
-      "Upgrade-Insecure-Requests": "1",
+  // 1. Session warmup — try all proxies
+  const r1 = await fetchWithProxyFallback(
+    `https://vixsrc.to/movie/${movieId}`,
+    {
+      headers: {
+        ...BASE_HEADERS,
+        Accept: "text/html,application/xhtml+xml,*/*;q=0.8",
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "none",
+        "Upgrade-Insecure-Requests": "1",
+      },
     },
-  });
+    "warmup"
+  );
 
   // Collect cookies
   let cookieStr = "";
@@ -113,19 +120,23 @@ async function getStream(movieId) {
       .join("; ");
   }
 
-  // 2. Get embed URL from API
+  // 2. Get embed URL from API — try all proxies
   async function getEmbedUrl() {
-    const r = await proxiedFetch(`https://vixsrc.to/api/movie/${movieId}`, {
-      headers: {
-        ...BASE_HEADERS,
-        Accept: "application/json, text/plain, */*",
-        Referer: `https://vixsrc.to/movie/${movieId}`,
-        Cookie: cookieStr,
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-origin",
+    const r = await fetchWithProxyFallback(
+      `https://vixsrc.to/api/movie/${movieId}`,
+      {
+        headers: {
+          ...BASE_HEADERS,
+          Accept: "application/json, text/plain, */*",
+          Referer: `https://vixsrc.to/movie/${movieId}`,
+          Cookie: cookieStr,
+          "sec-fetch-dest": "empty",
+          "sec-fetch-mode": "cors",
+          "sec-fetch-site": "same-origin",
+        },
       },
-    });
+      "api"
+    );
 
     if (!r.ok) {
       const body = await r.text();
@@ -141,23 +152,10 @@ async function getStream(movieId) {
 
   let src = await getEmbedUrl();
 
-  // 3. Fetch embed page
-  let r2 = await proxiedFetch(src, {
-    headers: {
-      ...BASE_HEADERS,
-      Accept: "text/html,application/xhtml+xml,*/*;q=0.8",
-      Referer: "https://vixsrc.to/",
-      Cookie: cookieStr,
-      "sec-fetch-dest": "iframe",
-      "sec-fetch-mode": "navigate",
-      "sec-fetch-site": "same-origin",
-    },
-  });
-
-  // Retry on 410
-  if (r2.status === 410) {
-    src = await getEmbedUrl();
-    r2 = await proxiedFetch(src, {
+  // 3. Fetch embed page — try all proxies
+  let r2 = await fetchWithProxyFallback(
+    src,
+    {
       headers: {
         ...BASE_HEADERS,
         Accept: "text/html,application/xhtml+xml,*/*;q=0.8",
@@ -167,7 +165,28 @@ async function getStream(movieId) {
         "sec-fetch-mode": "navigate",
         "sec-fetch-site": "same-origin",
       },
-    });
+    },
+    "embed"
+  );
+
+  // Retry on 410
+  if (r2.status === 410) {
+    src = await getEmbedUrl();
+    r2 = await fetchWithProxyFallback(
+      src,
+      {
+        headers: {
+          ...BASE_HEADERS,
+          Accept: "text/html,application/xhtml+xml,*/*;q=0.8",
+          Referer: "https://vixsrc.to/",
+          Cookie: cookieStr,
+          "sec-fetch-dest": "iframe",
+          "sec-fetch-mode": "navigate",
+          "sec-fetch-site": "same-origin",
+        },
+      },
+      "embed-retry"
+    );
   }
 
   if (r2.status !== 200 && r2.status !== 304) {
@@ -178,18 +197,22 @@ async function getStream(movieId) {
   const playlistUrl = parseMasterPlaylist(html);
   if (!playlistUrl) throw new Error("Could not extract playlist URL from embed page");
 
-  // 4. Fetch M3U8
-  const r3 = await proxiedFetch(playlistUrl, {
-    headers: {
-      ...BASE_HEADERS,
-      Accept: "*/*",
-      Referer: src,
-      Cookie: cookieStr,
-      "sec-fetch-dest": "empty",
-      "sec-fetch-mode": "cors",
-      "sec-fetch-site": "same-origin",
+  // 4. Fetch M3U8 — try all proxies
+  const r3 = await fetchWithProxyFallback(
+    playlistUrl,
+    {
+      headers: {
+        ...BASE_HEADERS,
+        Accept: "*/*",
+        Referer: src,
+        Cookie: cookieStr,
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+      },
     },
-  });
+    "m3u8"
+  );
 
   if (!r3.ok) throw new Error(`Playlist fetch returned ${r3.status}`);
   const m3u8 = await r3.text();
