@@ -3,9 +3,12 @@ import { SocksProxyAgent } from "socks-proxy-agent";
 import { spawn } from "child_process";
 import { promisify } from "util";
 import { exec } from "child_process";
-import { writeFileSync, mkdirSync } from "fs";
+import { writeFileSync, mkdirSync, existsSync } from "fs";
+import { resolve, dirname } from "path";
+import { fileURLToPath } from "url";
 
 const execAsync = promisify(exec);
+const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -21,19 +24,38 @@ function log(msg) {
 
 async function startTor() {
   try {
-    // tor is installed at build time — find it
-    let torBin = null;
-    const candidates = ["/usr/bin/tor", "/usr/sbin/tor", "/usr/local/bin/tor"];
-    for (const bin of candidates) {
-      try { await execAsync(`test -f ${bin}`); torBin = bin; break; } catch {}
-    }
-    if (!torBin) {
-      try { const { stdout } = await execAsync("which tor"); torBin = stdout.trim(); } catch {}
-    }
-    if (!torBin) { log("[tor] FATAL: tor binary not found — was it installed at build time?"); return; }
-    log(`[tor] binary: ${torBin}`);
+    // Find tor binary — check local ./tor-bin first (installed at build time)
+    const candidates = [
+      resolve(__dirname, "tor-bin/tor"),
+      "/usr/bin/tor",
+      "/usr/sbin/tor",
+      "/usr/local/bin/tor",
+    ];
 
-    // Write torrc and data dir to /tmp
+    let torBin = null;
+    for (const bin of candidates) {
+      if (existsSync(bin)) { torBin = bin; break; }
+    }
+    // fallback: which tor
+    if (!torBin) {
+      try { torBin = (await execAsync("which tor")).stdout.trim(); } catch {}
+    }
+
+    if (!torBin) {
+      log("[tor] FATAL: tor binary not found in: " + candidates.join(", "));
+      return;
+    }
+    log(`[tor] using binary: ${torBin}`);
+
+    // Verify it runs
+    try {
+      const { stdout } = await execAsync(`${torBin} --version`);
+      log(`[tor] version: ${stdout.trim()}`);
+    } catch (e) {
+      log(`[tor] version check failed: ${e.message}`);
+    }
+
+    // Setup dirs and torrc in /tmp
     const dataDir = "/tmp/tor-data";
     mkdirSync(dataDir, { recursive: true });
     const torrcPath = "/tmp/torrc";
@@ -46,11 +68,13 @@ async function startTor() {
       "MaxCircuitDirtiness 10",
       "NewCircuitPeriod 10",
     ].join("\n"));
-    log(`[tor] torrc written`);
+    log("[tor] torrc written to /tmp/torrc");
 
+    // Kill old tor
     try { await execAsync("pkill -9 tor 2>/dev/null"); } catch {}
     await new Promise(r => setTimeout(r, 500));
 
+    // Spawn
     const torProc = spawn(torBin, ["-f", torrcPath], {
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -59,13 +83,19 @@ async function startTor() {
     const onData = (data) => {
       for (const line of data.toString().split("\n").filter(l => l.trim())) {
         log(`[tor] ${line}`);
-        if (line.includes("Bootstrapped 100")) { torReady = true; log("[tor] ✅ READY!"); }
+        if (line.includes("Bootstrapped 100")) {
+          torReady = true;
+          log("[tor] ✅ READY!");
+        }
       }
     };
     torProc.stdout.on("data", onData);
     torProc.stderr.on("data", onData);
     torProc.on("error", e => log(`[tor] spawn error: ${e.message}`));
-    torProc.on("exit", (code, sig) => { log(`[tor] exited code=${code} sig=${sig}`); torReady = false; });
+    torProc.on("exit", (code, sig) => {
+      log(`[tor] exited code=${code} sig=${sig}`);
+      torReady = false;
+    });
 
     for (let i = 0; i < 120; i++) {
       await new Promise(r => setTimeout(r, 1000));
