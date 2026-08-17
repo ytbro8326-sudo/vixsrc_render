@@ -21,8 +21,7 @@ const PROXY_USER = "dxicdysy";
 const PROXY_PASS = "yndikr9coeto";
 
 // ── Headers ───────────────────────────────────────────────────────────────────
-const UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
+const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
 
 const BASE_HEADERS = {
   "User-Agent": UA,
@@ -65,37 +64,45 @@ function parseMasterPlaylist(html) {
     : null;
 }
 
-// ── Fetch with fallback across ALL proxies ────────────────────────────────────
-async function fetchWithProxyFallback(url, options = {}, label = "") {
-  // Shuffle proxy list so we don't always hammer the same one first
-  const shuffled = [...PROXIES].sort(() => Math.random() - 0.5);
+// ── Fetch with direct + all proxy fallback ────────────────────────────────────
+async function fetchWithFallback(url, options = {}, label = "") {
+  // Build attempt list: direct first, then all proxies shuffled
+  const proxyAttempts = [...PROXIES]
+    .sort(() => Math.random() - 0.5)
+    .map(p => `http://${PROXY_USER}:${PROXY_PASS}@${p}`);
 
-  for (let i = 0; i < shuffled.length; i++) {
-    const proxyUrl = `http://${PROXY_USER}:${PROXY_PASS}@${shuffled[i]}`;
-    const agent = new HttpsProxyAgent(proxyUrl);
+  const attempts = [null, ...proxyAttempts]; // null = direct (no proxy)
+
+  for (let i = 0; i < attempts.length; i++) {
+    const proxyUrl = attempts[i];
+    const label2 = proxyUrl ? `proxy[${i}] ${proxyUrl.split("@")[1]}` : "direct";
     try {
-      console.log(`[${label}] Trying proxy ${i + 1}/${shuffled.length}: ${shuffled[i]}`);
-      const res = await fetch(url, { ...options, agent });
+      console.log(`[${label}] Attempt ${i + 1}/${attempts.length} via ${label2}`);
+      const fetchOpts = { ...options };
+      if (proxyUrl) fetchOpts.agent = new HttpsProxyAgent(proxyUrl);
 
-      if (res.status === 403 || res.status === 429) {
-        console.warn(`[${label}] Proxy ${shuffled[i]} got ${res.status}, trying next...`);
-        continue; // try next proxy
+      const res = await fetch(url, fetchOpts);
+
+      if (res.status === 403 || res.status === 429 || res.status === 407) {
+        const body = await res.text();
+        console.warn(`[${label}] ${label2} → ${res.status}, trying next. Body snippet: ${body.substring(0, 80)}`);
+        continue;
       }
 
-      console.log(`[${label}] Success with proxy ${shuffled[i]} → status ${res.status}`);
-      return res; // ✅ good response
+      console.log(`[${label}] ✅ Success via ${label2} → ${res.status}`);
+      return res;
     } catch (err) {
-      console.warn(`[${label}] Proxy ${shuffled[i]} threw: ${err.message}, trying next...`);
+      console.warn(`[${label}] ${label2} threw: ${err.message}`);
     }
   }
 
-  throw new Error(`All ${shuffled.length} proxies failed for: ${url}`);
+  throw new Error(`All ${attempts.length} attempts failed (1 direct + ${PROXIES.length} proxies) for: ${url}`);
 }
 
 // ── Core logic ────────────────────────────────────────────────────────────────
 async function getStream(movieId) {
-  // 1. Session warmup — try all proxies
-  const r1 = await fetchWithProxyFallback(
+  // 1. Session warmup
+  const r1 = await fetchWithFallback(
     `https://vixsrc.to/movie/${movieId}`,
     {
       headers: {
@@ -119,10 +126,11 @@ async function getStream(movieId) {
       .map((c) => c.split(";")[0].trim())
       .join("; ");
   }
+  console.log(`[cookies] ${cookieStr || "(none)"}`);
 
-  // 2. Get embed URL from API — try all proxies
+  // 2. Get embed URL from API
   async function getEmbedUrl() {
-    const r = await fetchWithProxyFallback(
+    const r = await fetchWithFallback(
       `https://vixsrc.to/api/movie/${movieId}`,
       {
         headers: {
@@ -144,16 +152,18 @@ async function getStream(movieId) {
     }
 
     const text = await r.text();
+    console.log(`[api] raw response: ${text.substring(0, 200)}`);
     const data = decodeApiResponse(text);
     let src = data.src || "";
     if (src.startsWith("/")) src = "https://vixsrc.to" + src;
+    console.log(`[api] embed src: ${src}`);
     return src;
   }
 
   let src = await getEmbedUrl();
 
-  // 3. Fetch embed page — try all proxies
-  let r2 = await fetchWithProxyFallback(
+  // 3. Fetch embed page
+  let r2 = await fetchWithFallback(
     src,
     {
       headers: {
@@ -171,8 +181,9 @@ async function getStream(movieId) {
 
   // Retry on 410
   if (r2.status === 410) {
+    console.log("[embed] Got 410, refreshing embed URL...");
     src = await getEmbedUrl();
-    r2 = await fetchWithProxyFallback(
+    r2 = await fetchWithFallback(
       src,
       {
         headers: {
@@ -194,11 +205,14 @@ async function getStream(movieId) {
   }
 
   const html = await r2.text();
+  console.log(`[embed] html length: ${html.length}, has masterPlaylist: ${html.includes("masterPlaylist")}`);
+
   const playlistUrl = parseMasterPlaylist(html);
   if (!playlistUrl) throw new Error("Could not extract playlist URL from embed page");
+  console.log(`[playlist] url: ${playlistUrl}`);
 
-  // 4. Fetch M3U8 — try all proxies
-  const r3 = await fetchWithProxyFallback(
+  // 4. Fetch M3U8
+  const r3 = await fetchWithFallback(
     playlistUrl,
     {
       headers: {
