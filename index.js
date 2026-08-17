@@ -19,111 +19,61 @@ function log(msg) {
   console.log(msg);
 }
 
-// ── Start Tor ─────────────────────────────────────────────────────────────────
 async function startTor() {
   try {
-    // Check if tor is already installed
+    // tor is installed at build time — find it
     let torBin = null;
-    for (const bin of ["/usr/bin/tor", "/usr/sbin/tor", "/bin/tor"]) {
-      try {
-        await execAsync(`test -f ${bin}`);
-        torBin = bin;
-        log(`[tor] found at ${torBin}`);
-        break;
-      } catch {}
+    const candidates = ["/usr/bin/tor", "/usr/sbin/tor", "/usr/local/bin/tor"];
+    for (const bin of candidates) {
+      try { await execAsync(`test -f ${bin}`); torBin = bin; break; } catch {}
     }
-
     if (!torBin) {
-      log("[tor] not found, installing...");
-      try {
-        const { stdout } = await execAsync("apt-get update -qq 2>&1 && apt-get install -y tor 2>&1");
-        log("[tor] install output: " + stdout.slice(-200));
-        torBin = "/usr/bin/tor";
-      } catch (e) {
-        log("[tor] apt install failed: " + e.message);
-        // Try snap or other methods
-        try {
-          await execAsync("which tor");
-          torBin = "tor";
-          log("[tor] found tor in PATH");
-        } catch {
-          log("[tor] FATAL: cannot install tor");
-          return;
-        }
-      }
+      try { const { stdout } = await execAsync("which tor"); torBin = stdout.trim(); } catch {}
     }
+    if (!torBin) { log("[tor] FATAL: tor binary not found — was it installed at build time?"); return; }
+    log(`[tor] binary: ${torBin}`);
 
-    // Create data dir tor can write to
-    const torDataDir = "/tmp/tor-data";
+    // Write torrc and data dir to /tmp
+    const dataDir = "/tmp/tor-data";
+    mkdirSync(dataDir, { recursive: true });
     const torrcPath = "/tmp/torrc";
-    mkdirSync(torDataDir, { recursive: true });
-
-    // Write torrc to /tmp (always writable)
-    const torrc = [
+    writeFileSync(torrcPath, [
       "SocksPort 9050",
       "ControlPort 9051",
       "CookieAuthentication 0",
-      `DataDirectory ${torDataDir}`,
+      `DataDirectory ${dataDir}`,
       "Log notice stderr",
       "MaxCircuitDirtiness 10",
       "NewCircuitPeriod 10",
-    ].join("\n");
-    writeFileSync(torrcPath, torrc);
-    log(`[tor] torrc written to ${torrcPath}`);
-    log(`[tor] torrc contents: ${torrc.replace(/\n/g, " | ")}`);
+    ].join("\n"));
+    log(`[tor] torrc written`);
 
-    // Kill existing tor
     try { await execAsync("pkill -9 tor 2>/dev/null"); } catch {}
     await new Promise(r => setTimeout(r, 500));
 
-    // Spawn tor
-    log(`[tor] spawning: ${torBin} -f ${torrcPath}`);
     const torProc = spawn(torBin, ["-f", torrcPath], {
       stdio: ["ignore", "pipe", "pipe"],
-      detached: false,
     });
+    log(`[tor] spawned PID ${torProc.pid}`);
 
-    log(`[tor] PID: ${torProc.pid}`);
-
-    torProc.stdout.on("data", (data) => {
-      const lines = data.toString().split("\n").filter(l => l.trim());
-      for (const line of lines) {
-        log(`[tor stdout] ${line}`);
-        if (line.includes("Bootstrapped 100")) {
-          torReady = true;
-          log("[tor] ✅ READY!");
-        }
+    const onData = (data) => {
+      for (const line of data.toString().split("\n").filter(l => l.trim())) {
+        log(`[tor] ${line}`);
+        if (line.includes("Bootstrapped 100")) { torReady = true; log("[tor] ✅ READY!"); }
       }
-    });
+    };
+    torProc.stdout.on("data", onData);
+    torProc.stderr.on("data", onData);
+    torProc.on("error", e => log(`[tor] spawn error: ${e.message}`));
+    torProc.on("exit", (code, sig) => { log(`[tor] exited code=${code} sig=${sig}`); torReady = false; });
 
-    torProc.stderr.on("data", (data) => {
-      const lines = data.toString().split("\n").filter(l => l.trim());
-      for (const line of lines) {
-        log(`[tor stderr] ${line}`);
-        if (line.includes("Bootstrapped 100")) {
-          torReady = true;
-          log("[tor] ✅ READY (stderr)!");
-        }
-      }
-    });
-
-    torProc.on("error", (e) => log(`[tor] spawn error: ${e.message}`));
-    torProc.on("exit", (code, sig) => {
-      log(`[tor] exited code=${code} signal=${sig}`);
-      torReady = false;
-    });
-
-    // Wait up to 120s
     for (let i = 0; i < 120; i++) {
       await new Promise(r => setTimeout(r, 1000));
       if (torReady) return;
-      if (i % 20 === 0 && i > 0) log(`[tor] still waiting... ${i}s`);
     }
-
-    log("[tor] ⚠️ 120s timeout — check /tor-log");
-
+    log("[tor] ⚠️ timed out after 120s");
   } catch (e) {
-    log("[tor] startTor exception: " + e.message);
+    log("[tor] exception: " + e.message);
   }
 }
 
@@ -131,13 +81,10 @@ async function rotateTorCircuit() {
   try {
     await execAsync(`echo -e 'AUTHENTICATE ""\\r\\nSIGNAL NEWNYM\\r\\nQUIT' | nc -q1 127.0.0.1 9051 2>/dev/null || true`);
     await new Promise(r => setTimeout(r, 3000));
-    log("[tor] 🔄 circuit rotated");
-  } catch (e) {
-    log("[tor] rotate failed: " + e.message);
-  }
+    log("[tor] 🔄 rotated");
+  } catch (e) { log("[tor] rotate failed: " + e.message); }
 }
 
-// ── Headers ───────────────────────────────────────────────────────────────────
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
 const BASE_HEADERS = {
   "User-Agent": UA,
@@ -257,19 +204,13 @@ async function getStream(movieId) {
   return { master_m3u8: playlistUrl, raw_m3u8: await r3.text() };
 }
 
-// ── Routes ────────────────────────────────────────────────────────────────────
 app.get("/", (req, res) => res.json({ status: "ok", tor: torReady }));
 app.get("/tor-log", (req, res) => res.json({ ready: torReady, log: torLog }));
-
 app.get("/stream", async (req, res) => {
   const movieId = req.query.id;
   if (!movieId) return res.status(400).json({ error: "Missing ?id=" });
-  try {
-    res.json(await getStream(movieId));
-  } catch (err) {
-    console.error("[ERROR]", err.message);
-    res.status(500).json({ error: err.message });
-  }
+  try { res.json(await getStream(movieId)); }
+  catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.listen(PORT, () => {
