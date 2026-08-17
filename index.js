@@ -1,8 +1,17 @@
 import express from "express";
 import { HttpsProxyAgent } from "https-proxy-agent";
+import { SocksProxyAgent } from "socks-proxy-agent";
+import { exec } from "child_process";
+import { promisify } from "util";
 
+const execAsync = promisify(exec);
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// ── Tor SOCKS5 proxy ──────────────────────────────────────────────────────────
+const TOR_SOCKS = "socks5h://127.0.0.1:9050";
+const TOR_CONTROL_PORT = 9051;
+const TOR_CONTROL_PASS = ""; // empty = no password (we use CookieAuth or no auth)
 
 // ── Your paid proxies ─────────────────────────────────────────────────────────
 const PAID_PROXIES = [
@@ -18,76 +27,75 @@ const PAID_PROXIES = [
   "http://dxicdysy:yndikr9coeto@191.96.254.138:6185",
 ];
 
-// ── Free proxy sources ────────────────────────────────────────────────────────
-async function fetchFreeProxies() {
-  const proxies = [];
+// ── Start Tor ─────────────────────────────────────────────────────────────────
+let torReady = false;
 
-  // Source 1: proxifly
+async function startTor() {
   try {
-    const r = await fetch("https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.json", {
-      signal: AbortSignal.timeout(8000)
-    });
-    if (r.ok) {
-      const list = await r.json();
-      for (const p of list.slice(0, 100)) {
-        if (p.ip && p.port) proxies.push(`http://${p.ip}:${p.port}`);
-      }
-      console.log(`[free-proxies] proxifly: ${proxies.length} proxies`);
+    // Install tor if not present
+    console.log("[tor] Checking tor installation...");
+    try {
+      await execAsync("which tor");
+      console.log("[tor] tor already installed");
+    } catch {
+      console.log("[tor] Installing tor...");
+      await execAsync("apt-get update -qq && apt-get install -y tor 2>&1");
+      console.log("[tor] tor installed");
     }
-  } catch (e) { console.warn("[free-proxies] proxifly failed:", e.message); }
 
-  // Source 2: TheSpeedX list
+    // Write torrc with control port enabled (no password)
+    const torrc = `
+SocksPort 9050
+ControlPort 9051
+CookieAuthentication 0
+HashedControlPassword ""
+MaxCircuitDirtiness 10
+NewCircuitPeriod 10
+`;
+    await execAsync(`echo '${torrc}' > /etc/tor/torrc`);
+
+    // Kill any existing tor process
+    try { await execAsync("pkill tor"); await new Promise(r => setTimeout(r, 1000)); } catch {}
+
+    // Start tor in background
+    console.log("[tor] Starting tor daemon...");
+    exec("tor -f /etc/tor/torrc > /tmp/tor.log 2>&1 &");
+
+    // Wait for tor to bootstrap (up to 60s)
+    for (let i = 0; i < 60; i++) {
+      await new Promise(r => setTimeout(r, 1000));
+      try {
+        const { stdout } = await execAsync("cat /tmp/tor.log 2>/dev/null | grep -i 'Bootstrapped 100'");
+        if (stdout.includes("Bootstrapped 100")) {
+          console.log("[tor] ✅ Tor bootstrapped successfully!");
+          torReady = true;
+          return true;
+        }
+        if (i % 5 === 0) {
+          const { stdout: log } = await execAsync("tail -3 /tmp/tor.log 2>/dev/null || echo 'no log'");
+          console.log(`[tor] waiting... (${i}s) ${log.trim()}`);
+        }
+      } catch {}
+    }
+
+    console.warn("[tor] ⚠️ Tor did not bootstrap in 60s, will try anyway");
+    torReady = true;
+    return false;
+  } catch (e) {
+    console.error("[tor] Failed to start tor:", e.message);
+    return false;
+  }
+}
+
+// Rotate Tor circuit (get new exit IP)
+async function rotateTorCircuit() {
   try {
-    const r = await fetch("https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt", {
-      signal: AbortSignal.timeout(8000)
-    });
-    if (r.ok) {
-      const text = await r.text();
-      const lines = text.trim().split("\n").slice(0, 200);
-      for (const line of lines) {
-        const [ip, port] = line.trim().split(":");
-        if (ip && port) proxies.push(`http://${ip}:${port}`);
-      }
-      console.log(`[free-proxies] TheSpeedX total now: ${proxies.length}`);
-    }
-  } catch (e) { console.warn("[free-proxies] TheSpeedX failed:", e.message); }
-
-  // Source 3: clarketm list
-  try {
-    const r = await fetch("https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt", {
-      signal: AbortSignal.timeout(8000)
-    });
-    if (r.ok) {
-      const text = await r.text();
-      const lines = text.trim().split("\n").slice(0, 100);
-      for (const line of lines) {
-        const clean = line.trim().split(" ")[0];
-        if (clean && clean.includes(":")) proxies.push(`http://${clean}`);
-      }
-      console.log(`[free-proxies] clarketm total now: ${proxies.length}`);
-    }
-  } catch (e) { console.warn("[free-proxies] clarketm failed:", e.message); }
-
-  // Source 4: hookzof list
-  try {
-    const r = await fetch("https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt", {
-      signal: AbortSignal.timeout(8000)
-    });
-    if (r.ok) {
-      const text = await r.text();
-      const lines = text.trim().split("\n").slice(0, 100);
-      for (const line of lines) {
-        const clean = line.trim();
-        if (clean && clean.includes(":")) proxies.push(`socks5://${clean}`);
-      }
-      console.log(`[free-proxies] hookzof total now: ${proxies.length}`);
-    }
-  } catch (e) { console.warn("[free-proxies] hookzof failed:", e.message); }
-
-  // Shuffle and dedupe
-  const unique = [...new Set(proxies)].sort(() => Math.random() - 0.5);
-  console.log(`[free-proxies] Total unique free proxies: ${unique.length}`);
-  return unique;
+    await execAsync(`echo -e 'AUTHENTICATE ""\r\nSIGNAL NEWNYM\r\nQUIT' | nc 127.0.0.1 ${TOR_CONTROL_PORT}`);
+    await new Promise(r => setTimeout(r, 2000)); // wait for new circuit
+    console.log("[tor] 🔄 Circuit rotated");
+  } catch (e) {
+    console.warn("[tor] Could not rotate circuit:", e.message);
+  }
 }
 
 // ── Headers ───────────────────────────────────────────────────────────────────
@@ -128,53 +136,82 @@ function parseMasterPlaylist(html) {
   return (baseUrl && token) ? `${baseUrl}?token=${token}&expires=${expires}&h=1&lang=en` : null;
 }
 
-// ── Try a single proxy/direct for a URL ──────────────────────────────────────
-async function tryFetch(url, options, proxyUrl = null) {
-  const fetchOpts = { ...options, signal: AbortSignal.timeout(10000) };
-  if (proxyUrl) fetchOpts.agent = new HttpsProxyAgent(proxyUrl);
-  const res = await fetch(url, fetchOpts);
-  return res;
+// ── Single fetch attempt ──────────────────────────────────────────────────────
+async function tryFetch(url, options, agentUrl = null) {
+  const fetchOpts = { ...options, signal: AbortSignal.timeout(15000) };
+  if (agentUrl) {
+    fetchOpts.agent = agentUrl.startsWith("socks")
+      ? new SocksProxyAgent(agentUrl)
+      : new HttpsProxyAgent(agentUrl);
+  }
+  return await fetch(url, fetchOpts);
 }
 
-// ── Fetch trying direct then paid then free proxies ───────────────────────────
-async function fetchWithFallback(url, options = {}, label = "", freeProxies = []) {
-  // Order: direct → paid proxies → free proxies
+// ── Fetch with full fallback chain ────────────────────────────────────────────
+async function fetchWithFallback(url, options = {}, label = "") {
+  // Build attempt list
   const attempts = [
-    { label: "direct", proxy: null },
-    ...PAID_PROXIES.map(p => ({ label: `paid:${p.split("@")[1]}`, proxy: p })),
-    ...freeProxies.map(p => ({ label: `free:${p}`, proxy: p })),
+    { name: "direct",    agent: null },
+    { name: "tor",       agent: TOR_SOCKS },
+    ...PAID_PROXIES.map((p, i) => ({ name: `paid-${i + 1}`, agent: p })),
   ];
 
   for (let i = 0; i < attempts.length; i++) {
-    const { label: aLabel, proxy } = attempts[i];
+    const { name, agent } = attempts[i];
     try {
-      process.stdout.write(`[${label}] ${i + 1}/${attempts.length} ${aLabel} ... `);
-      const res = await tryFetch(url, options, proxy);
+      process.stdout.write(`[${label}] ${i + 1}/${attempts.length} via ${name} ... `);
+      const res = await tryFetch(url, options, agent);
 
-      if (res.status === 403 || res.status === 429 || res.status === 407 || res.status === 502) {
+      if ([403, 407, 429, 502, 503].includes(res.status)) {
         console.log(`❌ ${res.status}`);
+        // Rotate Tor circuit if Tor just failed
+        if (name === "tor") await rotateTorCircuit();
         continue;
       }
+
       console.log(`✅ ${res.status}`);
       return res;
     } catch (e) {
-      console.log(`💥 ${e.message.substring(0, 60)}`);
+      console.log(`💥 ${e.message.substring(0, 80)}`);
     }
   }
 
-  throw new Error(`All ${attempts.length} attempts failed for: ${url}`);
+  // Last resort: retry Tor with 3 fresh circuits
+  console.log(`[${label}] Trying Tor with 3 fresh circuits...`);
+  for (let i = 0; i < 3; i++) {
+    await rotateTorCircuit();
+    try {
+      process.stdout.write(`[${label}] Tor circuit ${i + 1}/3 ... `);
+      const res = await tryFetch(url, options, TOR_SOCKS);
+      if (![403, 407, 429, 502, 503].includes(res.status)) {
+        console.log(`✅ ${res.status}`);
+        return res;
+      }
+      console.log(`❌ ${res.status}`);
+    } catch (e) {
+      console.log(`💥 ${e.message.substring(0, 80)}`);
+    }
+  }
+
+  throw new Error(`All attempts failed for: ${url}`);
 }
 
 // ── Core logic ────────────────────────────────────────────────────────────────
 async function getStream(movieId) {
-  console.log(`\n[getStream] movie=${movieId} — fetching free proxies...`);
-  const freeProxies = await fetchFreeProxies();
+  // Wait for Tor if still starting
+  if (!torReady) {
+    console.log("[getStream] Waiting for Tor to be ready...");
+    for (let i = 0; i < 30; i++) {
+      if (torReady) break;
+      await new Promise(r => setTimeout(r, 1000));
+    }
+  }
 
   // 1. Warmup
   const r1 = await fetchWithFallback(
     `https://vixsrc.to/movie/${movieId}`,
     { headers: { ...BASE_HEADERS, Accept: "text/html,application/xhtml+xml,*/*;q=0.8", "sec-fetch-dest": "document", "sec-fetch-mode": "navigate", "sec-fetch-site": "none", "Upgrade-Insecure-Requests": "1" } },
-    "warmup", freeProxies
+    "warmup"
   );
 
   let cookieStr = "";
@@ -189,7 +226,7 @@ async function getStream(movieId) {
     const r = await fetchWithFallback(
       `https://vixsrc.to/api/movie/${movieId}`,
       { headers: { ...BASE_HEADERS, Accept: "application/json, text/plain, */*", Referer: `https://vixsrc.to/movie/${movieId}`, Cookie: cookieStr, "sec-fetch-dest": "empty", "sec-fetch-mode": "cors", "sec-fetch-site": "same-origin" } },
-      "api", freeProxies
+      "api"
     );
     if (!r.ok) { const b = await r.text(); throw new Error(`API ${r.status}: ${b.substring(0, 200)}`); }
     const text = await r.text();
@@ -206,12 +243,12 @@ async function getStream(movieId) {
   let r2 = await fetchWithFallback(
     src,
     { headers: { ...BASE_HEADERS, Accept: "text/html,application/xhtml+xml,*/*;q=0.8", Referer: "https://vixsrc.to/", Cookie: cookieStr, "sec-fetch-dest": "iframe", "sec-fetch-mode": "navigate", "sec-fetch-site": "same-origin" } },
-    "embed", freeProxies
+    "embed"
   );
 
   if (r2.status === 410) {
     src = await getEmbedUrl();
-    r2 = await fetchWithFallback(src, { headers: { ...BASE_HEADERS, Accept: "text/html,application/xhtml+xml,*/*;q=0.8", Referer: "https://vixsrc.to/", Cookie: cookieStr, "sec-fetch-dest": "iframe", "sec-fetch-mode": "navigate", "sec-fetch-site": "same-origin" } }, "embed-retry", freeProxies);
+    r2 = await fetchWithFallback(src, { headers: { ...BASE_HEADERS, Accept: "text/html,application/xhtml+xml,*/*;q=0.8", Referer: "https://vixsrc.to/", Cookie: cookieStr, "sec-fetch-dest": "iframe", "sec-fetch-mode": "navigate", "sec-fetch-site": "same-origin" } }, "embed-retry");
   }
 
   if (r2.status !== 200 && r2.status !== 304) throw new Error(`Embed page returned ${r2.status}`);
@@ -225,7 +262,7 @@ async function getStream(movieId) {
   const r3 = await fetchWithFallback(
     playlistUrl,
     { headers: { ...BASE_HEADERS, Accept: "*/*", Referer: src, Cookie: cookieStr, "sec-fetch-dest": "empty", "sec-fetch-mode": "cors", "sec-fetch-site": "same-origin" } },
-    "m3u8", freeProxies
+    "m3u8"
   );
 
   if (!r3.ok) throw new Error(`Playlist fetch returned ${r3.status}`);
@@ -235,7 +272,7 @@ async function getStream(movieId) {
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
-  res.json({ status: "ok", usage: "GET /stream?id=<tmdb_movie_id>" });
+  res.json({ status: "ok", tor: torReady, usage: "GET /stream?id=<tmdb_movie_id>" });
 });
 
 app.get("/stream", async (req, res) => {
@@ -250,4 +287,9 @@ app.get("/stream", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
+// ── Start ─────────────────────────────────────────────────────────────────────
+app.listen(PORT, () => {
+  console.log(`✅ Server running on port ${PORT}`);
+  // Start Tor in background — don't block server startup
+  startTor().catch(e => console.error("[tor] startup error:", e.message));
+});
