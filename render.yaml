@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: vixsrc-render
+    runtime: node
+    buildCommand: apt-get update -qq && apt-get install -y tor netcat-openbsd && npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
