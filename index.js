@@ -1,7 +1,8 @@
 import express from "express";
 import { SocksProxyAgent } from "socks-proxy-agent";
-import { exec } from "child_process";
+import { exec, spawn } from "child_process";
 import { promisify } from "util";
+import { writeFileSync } from "fs";
 
 const execAsync = promisify(exec);
 const app = express();
@@ -9,43 +10,73 @@ const PORT = process.env.PORT || 3000;
 
 const TOR_SOCKS = "socks5h://127.0.0.1:9050";
 let torReady = false;
+let torLog = [];
 
 // ── Start Tor ─────────────────────────────────────────────────────────────────
 async function startTor() {
   try {
-    try {
-      await execAsync("which tor");
-      console.log("[tor] already installed");
-    } catch {
-      console.log("[tor] installing...");
-      await execAsync("apt-get update -qq && apt-get install -y tor netcat-openbsd 2>&1");
-    }
+    // Install tor + deps
+    console.log("[tor] installing tor...");
+    const { stdout: installOut } = await execAsync(
+      "apt-get update -qq 2>&1 && apt-get install -y tor netcat-openbsd 2>&1"
+    );
+    console.log("[tor] install done:", installOut.slice(-100));
 
-    const torrc = `SocksPort 9050\nControlPort 9051\nCookieAuthentication 0\nMaxCircuitDirtiness 10\nNewCircuitPeriod 10\n`;
-    await execAsync(`printf '%s' '${torrc}' > /etc/tor/torrc`);
+    // Write torrc directly with fs
+    const torrc = [
+      "SocksPort 9050",
+      "ControlPort 9051",
+      "CookieAuthentication 0",
+      "MaxCircuitDirtiness 10",
+      "NewCircuitPeriod 10",
+      "Log notice stdout",
+    ].join("\n");
+    writeFileSync("/etc/tor/torrc", torrc);
+    console.log("[tor] torrc written");
 
-    try { await execAsync("pkill tor"); await new Promise(r => setTimeout(r, 1000)); } catch {}
+    // Kill old tor
+    try { await execAsync("pkill -9 tor"); } catch {}
+    await new Promise(r => setTimeout(r, 1000));
 
-    exec("tor -f /etc/tor/torrc > /tmp/tor.log 2>&1 &");
-    console.log("[tor] starting daemon...");
+    // Spawn tor and capture stdout
+    const torProc = spawn("tor", ["-f", "/etc/tor/torrc"], { stdio: ["ignore", "pipe", "pipe"] });
 
-    for (let i = 0; i < 60; i++) {
+    torProc.stdout.on("data", (data) => {
+      const line = data.toString().trim();
+      torLog.push(line);
+      if (torLog.length > 50) torLog.shift();
+      console.log("[tor]", line);
+      if (line.includes("Bootstrapped 100%") || line.includes("Bootstrapped 100 percent")) {
+        torReady = true;
+        console.log("[tor] ✅ READY!");
+      }
+    });
+
+    torProc.stderr.on("data", (data) => {
+      const line = data.toString().trim();
+      torLog.push("[stderr] " + line);
+      console.log("[tor stderr]", line);
+      if (line.includes("Bootstrapped 100")) {
+        torReady = true;
+        console.log("[tor] ✅ READY (from stderr)!");
+      }
+    });
+
+    torProc.on("exit", (code) => {
+      console.log(`[tor] process exited with code ${code}`);
+      torReady = false;
+    });
+
+    // Wait up to 120s
+    for (let i = 0; i < 120; i++) {
       await new Promise(r => setTimeout(r, 1000));
-      try {
-        const { stdout } = await execAsync("grep -i 'Bootstrapped 100' /tmp/tor.log 2>/dev/null || true");
-        if (stdout.includes("Bootstrapped 100")) {
-          console.log("[tor] ✅ bootstrapped!");
-          torReady = true;
-          return;
-        }
-        if (i % 10 === 0) {
-          const { stdout: log } = await execAsync("tail -2 /tmp/tor.log 2>/dev/null || true");
-          console.log(`[tor] ${i}s ... ${log.trim()}`);
-        }
-      } catch {}
+      if (torReady) return;
+      if (i % 15 === 0) console.log(`[tor] waiting... ${i}s`);
     }
-    console.warn("[tor] ⚠️ did not bootstrap in 60s, trying anyway");
+
+    console.warn("[tor] ⚠️ 120s passed, marking ready anyway");
     torReady = true;
+
   } catch (e) {
     console.error("[tor] startup failed:", e.message);
   }
@@ -53,9 +84,9 @@ async function startTor() {
 
 async function rotateTorCircuit() {
   try {
-    await execAsync(`echo -e 'AUTHENTICATE ""\\r\\nSIGNAL NEWNYM\\r\\nQUIT' | nc 127.0.0.1 9051`);
-    await new Promise(r => setTimeout(r, 2000));
-    console.log("[tor] 🔄 new circuit");
+    await execAsync(`echo -e 'AUTHENTICATE ""\\r\\nSIGNAL NEWNYM\\r\\nQUIT' | nc -q1 127.0.0.1 9051 2>/dev/null || true`);
+    await new Promise(r => setTimeout(r, 3000));
+    console.log("[tor] 🔄 circuit rotated");
   } catch (e) {
     console.warn("[tor] rotate failed:", e.message);
   }
@@ -99,11 +130,11 @@ function parseMasterPlaylist(html) {
   return (baseUrl && token) ? `${baseUrl}?token=${token}&expires=${expires}&h=1&lang=en` : null;
 }
 
-// ── Tor fetch with circuit rotation retries ───────────────────────────────────
+// ── Tor fetch with retries ────────────────────────────────────────────────────
 async function torFetch(url, options = {}, label = "", maxRetries = 5) {
   for (let i = 0; i < maxRetries; i++) {
     try {
-      console.log(`[${label}] attempt ${i + 1}/${maxRetries} via Tor...`);
+      console.log(`[${label}] attempt ${i + 1}/${maxRetries}`);
       const agent = new SocksProxyAgent(TOR_SOCKS);
       const res = await fetch(url, { ...options, agent, signal: AbortSignal.timeout(20000) });
 
@@ -116,24 +147,24 @@ async function torFetch(url, options = {}, label = "", maxRetries = 5) {
       console.log(`[${label}] ✅ ${res.status}`);
       return res;
     } catch (e) {
-      console.log(`[${label}] 💥 ${e.message.substring(0, 80)} — rotating circuit...`);
+      console.log(`[${label}] 💥 ${e.message.slice(0, 80)} — rotating...`);
       await rotateTorCircuit();
     }
   }
-  throw new Error(`Tor failed after ${maxRetries} circuits for: ${url}`);
+  throw new Error(`Tor failed after ${maxRetries} attempts for: ${url}`);
 }
 
 // ── Core logic ────────────────────────────────────────────────────────────────
 async function getStream(movieId) {
   if (!torReady) {
     console.log("[getStream] waiting for Tor...");
-    for (let i = 0; i < 60; i++) {
+    for (let i = 0; i < 120; i++) {
       if (torReady) break;
       await new Promise(r => setTimeout(r, 1000));
     }
+    if (!torReady) throw new Error("Tor not ready yet — check /tor-log and retry in 30s");
   }
 
-  // 1. Warmup
   const r1 = await torFetch(
     `https://vixsrc.to/movie/${movieId}`,
     { headers: { ...BASE_HEADERS, Accept: "text/html,application/xhtml+xml,*/*;q=0.8", "sec-fetch-dest": "document", "sec-fetch-mode": "navigate", "sec-fetch-site": "none", "Upgrade-Insecure-Requests": "1" } },
@@ -141,22 +172,18 @@ async function getStream(movieId) {
   );
 
   let cookieStr = "";
-  const setCookieHeader = r1.headers.get("set-cookie");
-  if (setCookieHeader) {
-    cookieStr = setCookieHeader.split(/,(?=[^ ].*?=)/).map(c => c.split(";")[0].trim()).join("; ");
-  }
+  const sc = r1.headers.get("set-cookie");
+  if (sc) cookieStr = sc.split(/,(?=[^ ].*?=)/).map(c => c.split(";")[0].trim()).join("; ");
   console.log(`[cookies] ${cookieStr || "(none)"}`);
 
-  // 2. API
   async function getEmbedUrl() {
     const r = await torFetch(
       `https://vixsrc.to/api/movie/${movieId}`,
       { headers: { ...BASE_HEADERS, Accept: "application/json, text/plain, */*", Referer: `https://vixsrc.to/movie/${movieId}`, Cookie: cookieStr, "sec-fetch-dest": "empty", "sec-fetch-mode": "cors", "sec-fetch-site": "same-origin" } },
       "api"
     );
-    if (!r.ok) { const b = await r.text(); throw new Error(`API ${r.status}: ${b.substring(0, 200)}`); }
-    const text = await r.text();
-    const data = decodeApiResponse(text);
+    if (!r.ok) { const b = await r.text(); throw new Error(`API ${r.status}: ${b.slice(0, 200)}`); }
+    const data = decodeApiResponse(await r.text());
     let src = data.src || "";
     if (src.startsWith("/")) src = "https://vixsrc.to" + src;
     console.log(`[api] src: ${src}`);
@@ -165,7 +192,6 @@ async function getStream(movieId) {
 
   let src = await getEmbedUrl();
 
-  // 3. Embed page
   let r2 = await torFetch(
     src,
     { headers: { ...BASE_HEADERS, Accept: "text/html,application/xhtml+xml,*/*;q=0.8", Referer: "https://vixsrc.to/", Cookie: cookieStr, "sec-fetch-dest": "iframe", "sec-fetch-mode": "navigate", "sec-fetch-site": "same-origin" } },
@@ -180,11 +206,9 @@ async function getStream(movieId) {
   if (r2.status !== 200 && r2.status !== 304) throw new Error(`Embed page returned ${r2.status}`);
 
   const html = await r2.text();
-  console.log(`[embed] length=${html.length} hasMasterPlaylist=${html.includes("masterPlaylist")}`);
   const playlistUrl = parseMasterPlaylist(html);
   if (!playlistUrl) throw new Error("Could not extract playlist URL");
 
-  // 4. M3U8
   const r3 = await torFetch(
     playlistUrl,
     { headers: { ...BASE_HEADERS, Accept: "*/*", Referer: src, Cookie: cookieStr, "sec-fetch-dest": "empty", "sec-fetch-mode": "cors", "sec-fetch-site": "same-origin" } },
@@ -192,13 +216,17 @@ async function getStream(movieId) {
   );
 
   if (!r3.ok) throw new Error(`Playlist fetch returned ${r3.status}`);
-  const m3u8 = await r3.text();
-  return { master_m3u8: playlistUrl, raw_m3u8: m3u8 };
+  return { master_m3u8: playlistUrl, raw_m3u8: await r3.text() };
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
   res.json({ status: "ok", tor: torReady });
+});
+
+// Debug route — see raw tor log
+app.get("/tor-log", (req, res) => {
+  res.json({ ready: torReady, log: torLog });
 });
 
 app.get("/stream", async (req, res) => {
